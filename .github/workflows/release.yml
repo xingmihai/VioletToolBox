@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布标签，例如 v1.2.0'
+        required: true
+        default: 'v0.0.0-dev'
+      prerelease:
+        description: '标记为预发布版本'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  PROJECT_PATH: VioletToolBox/SmartTool.csproj
+  RUNTIME_ID: win-x64
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+
+jobs:
+  release:
+    name: 构建并发布 Windows x64 包
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 解析版本号
+        id: meta
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          $tag = if ($env:EVENT_NAME -eq 'workflow_dispatch') { $env:INPUT_TAG } else { $env:REF_NAME }
+          if ([string]::IsNullOrWhiteSpace($tag)) { throw '未能解析发布标签' }
+          $version = $tag -replace '^v', ''
+          $isPre = ($env:EVENT_NAME -eq 'workflow_dispatch' -and $env:INPUT_PRERELEASE -eq 'true') -or ($version -match '-')
+          "TAG_NAME=$tag"              | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PKG_VERSION=$version"        | Out-File -FilePath $env:GITHUB_ENV -Append
+          "IS_PRERELEASE=$($isPre.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "zip=VioletToolBox-$version-win-x64.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "将发布 $tag（预发布：$($isPre.ToString().ToLower())）"
+
+      - name: 安装 .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: 还原依赖
+        run: dotnet restore "$env:PROJECT_PATH"
+
+      - name: 编译 Release
+        run: dotnet build "$env:PROJECT_PATH" -c Release --no-restore
+
+      - name: 发布 x64 桌面版本
+        run: >
+          dotnet publish "$env:PROJECT_PATH"
+          -c Release
+          -r "$env:RUNTIME_ID"
+          --self-contained false
+          -p:Version="$env:PKG_VERSION"
+          -p:GeneratePackageOnBuild=false
+          -o publish
+
+      - name: 校验主程序产物
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'publish/VioletToolBox.exe')) {
+            throw 'publish 目录下没有 VioletToolBox.exe，发布中止'
+          }
+          Get-Item 'publish/VioletToolBox.exe' | Select-Object Name, Length
+
+      # 仓库源码不含 avbtool PEM、aria2c.exe、QSaharaServer.exe、scrcpy 等运行时工具。
+      # 把这些文件按发布包的目录结构放进 deps/overlay，本步骤会自动合并进产物。
+      - name: 合并可选运行时依赖
+        shell: pwsh
+        run: |
+          if (Test-Path 'deps/overlay') {
+            Copy-Item -Path 'deps/overlay/*' -Destination 'publish' -Recurse -Force
+            Write-Host '已合并 deps/overlay 中的运行时依赖'
+          } else {
+            Write-Host '::warning::未找到 deps/overlay，产物将缺少未随源码发布的运行时工具（avbtool PEM / aria2c.exe / QSaharaServer.exe / scrcpy 等）。'
+          }
+
+      - name: 打包并生成校验值
+        shell: pwsh
+        run: |
+          $zip = "${{ steps.meta.outputs.zip }}"
+          Compress-Archive -Path 'publish\*' -DestinationPath $zip -CompressionLevel Optimal
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path 'sha256.txt' -Value "$hash  $zip" -Encoding utf8
+          Get-ChildItem $zip, 'sha256.txt' | Select-Object Name, Length
+
+      - name: 保留构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: VioletToolBox-win-x64
+          path: |
+            ${{ steps.meta.outputs.zip }}
+            sha256.txt
+
+      - name: 创建 Release 并上传附件
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          name: VioletToolBox ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            ${{ steps.meta.outputs.zip }}
+            sha256.txt
